@@ -3,7 +3,7 @@ from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
 from constants import (CELESTIAL_GM, CELESTIAL_SOI, CELESTIAL_RADII,
                        get_heliocentric_state)
-from datetime import datetime
+from datetime import datetime, timedelta
 
 class Optimizer:
     def __init__(self, accel, integ_method='DOP853', rtol=1e-10, atol=1e-6,
@@ -14,7 +14,6 @@ class Optimizer:
         self.atol = atol
         self.max_step = max_step
         self.soi_margin = soi_margin
-
 
     def trajectory(self, start_pos, start_vel, direction, burn_time,
                    accel_modulus=None, date=None):
@@ -37,20 +36,50 @@ class Optimizer:
                                                   accel_vector, burn_time, date,
                                                   store_trajectory=True)
 
+    def maneuver(self, start_pos, start_vel, direction, burn_time,
+                 accel_modulus=None, date=None):
+        """Return final state after burn. Stores full trajectory internally."""
+        t, pos, vel, bodies = self.trajectory(start_pos, start_vel, direction,
+                                              burn_time, accel_modulus, date)
+        last_body = bodies[-1]
+        if last_body != 'sun':
+            end_pos, end_vel = self._convert_frame(pos[:, -1], vel[:, -1],
+                                                   last_body, 'sun', date)
+        else:
+            end_pos, end_vel = pos[:, -1], vel[:, -1]
+        return end_pos, end_vel
+
+    def maneuver_fast(self, start_pos, start_vel, direction, burn_time,
+                      accel_modulus=None, date=None):
+        """Return final state (heliocentric) without storing trajectory."""
+        if accel_modulus is None:
+            accel_modulus = self.accel
+        direction = np.asarray(direction, dtype=float)
+        norm = np.linalg.norm(direction)
+        if norm == 0:
+            return start_pos.copy(), start_vel.copy()
+        accel_vector = accel_modulus * direction / norm
+
+        start_body = self._determine_soi(start_pos, date)
+        pos_rel, vel_rel = self._convert_frame(start_pos, start_vel,
+                                               'sun', start_body, date)
+        end_pos_helio, end_vel_helio = self._integrate_with_soi_switching(
+            pos_rel, vel_rel, accel_vector, burn_time, date,
+            store_trajectory=False)
+        return end_pos_helio, end_vel_helio
+
     def brachistochrone_endpoint(self, start_pos, start_vel, theta, phi1, phi2,
                                  t1, t2, date=None):
-        """
-        Final state after boost-brake brachistochrone (with SOI switching).
-        """
+        """ Final state after flip and burn brachistochrone (with SOI switching). """
         u1 = np.array([np.cos(theta) * np.cos(phi1),
                        np.cos(theta) * np.sin(phi1),
                        np.sin(theta)])
-        pos1, vel1 = self._maneuver_fast(start_pos, start_vel, u1, t1, date=date)
+        pos1, vel1 = self.maneuver_fast(start_pos, start_vel, u1, t1, date=date)
 
         u2 = np.array([np.cos(theta) * np.cos(phi2),
                        np.cos(theta) * np.sin(phi2),
                        np.sin(theta)])
-        pos2, vel2 = self._maneuver_fast(pos1, vel1, -u2, t2, date=date)
+        pos2, vel2 = self.maneuver_fast(pos1, vel1, -u2, t2, date=date)
         return pos2, vel2
 
     def brachistochrone_endpoint_no_soi(self, start_pos, start_vel, theta, phi1, phi2,
@@ -113,7 +142,7 @@ class Optimizer:
         if phi2 > np.pi:
             phi2 -= 2 * np.pi
 
-        return theta, phi1, phi2, t1, t2  
+        return theta, phi1, phi2, t1, t2
 
     def find_brachistochrone(self, start_pos, start_vel, target_body,
                             date=None, initial_guess=None,
@@ -130,97 +159,105 @@ class Optimizer:
             start_date = datetime.strptime(date, '%Y-%m-%d %H:%M:%S')
         else:
             start_date = date
-
+        
         if initial_guess is None:
+            # Initial guess uses target state at departure date (approximation)
             target_pos, target_vel = get_heliocentric_state(target_body, start_date.strftime('%Y-%m-%d %H:%M:%S'))
             initial_guess = self.guess_brachistochrone(
                 start_pos, start_vel, target_pos, target_vel, start_date.strftime('%Y-%m-%d %H:%M:%S'))
 
         def objective(params):
             theta, phi1, phi2, t1, t2 = params
-            # if t1 <= 0 or t2 <= 0:
-            #     return 1e20
+            if t1 <= 0 or t2 <= 0:
+                return 1e20
+
             sc_pos, sc_vel = self.brachistochrone_endpoint_no_soi(
                 start_pos, start_vel, theta, phi1, phi2, t1, t2, 
                 start_date.strftime('%Y-%m-%d %H:%M:%S'))
+
             total_seconds = t1 + t2
             arrival_timestamp = start_date.timestamp() + total_seconds
             arrival_date = datetime.fromtimestamp(arrival_timestamp)
             arrival_date_str = arrival_date.strftime('%Y-%m-%d %H:%M:%S')
             target_pos, target_vel = get_heliocentric_state(target_body, arrival_date_str)
-            return self._cost_function(sc_pos, sc_vel, target_pos, target_vel)
 
-        default_opts = {'maxiter': 200, 
-                        'xtol': 1e-20,
-                        'gtol': 1e-20,
+            return self.cost_function(sc_pos, sc_vel, target_pos, target_vel)
+
+        default_opts = {'maxiter': 500, 
+                        'xtol': 1e-12,
+                        'gtol': 1e-12,
                         'verbose': 0}
         if options is not None:
             default_opts.update(options)
 
         result = minimize(objective, initial_guess,
-                        method=method, bounds=[(-np.pi, np.pi)]*3 + [(1e3, None)]*2,
+                        method=method, bounds=[(-np.pi/5, np.pi/5)] + [(-np.pi, np.pi)]*2 + [(1e3, None)]*2,
                         options=default_opts, tol=tol)
         return result
-
+    
     def brachistochrone_trajectory(self, start_pos, start_vel, theta, phi1, phi2,
-                                t1, t2, date=None, num_points=1000):
-            """
-            return full trajectory for flip-and-burn brachistochrone.
-            theta : elevation angle from ecliptic plane
-            phi1, phi2 : ecliptic longitude of thrust direction (rad)
-            t1, t2 : burn times, s
-            """
-            u1 = np.array([np.cos(theta) * np.cos(phi1),
-                        np.cos(theta) * np.sin(phi1),
-                        np.sin(theta)])
-            u2 = np.array([np.cos(theta) * np.cos(phi2),
-                        np.cos(theta) * np.sin(phi2),
-                        np.sin(theta)])
-            
-            accel_vec1 = self.accel * u1
-            accel_vec2 = -self.accel * u2
-            
-            t_boost = np.linspace(0, t1, num_points // 2)
-            t_brake = np.linspace(0, t2, num_points - len(t_boost))
-            
-            pos_points = []
-            vel_points = []
-            t_points = []
-            for t in t_boost:
-                if t == 0:
-                    pos, vel = start_pos.copy(), start_vel.copy()
-                else:
-                    pos, vel = self._integrate_helio_constant_accel(
-                        start_pos, start_vel, accel_vec1, t, date)
-                pos_points.append(pos)
-                vel_points.append(vel)
-                t_points.append(t)
-            
-            turn_pos, turn_vel = self._integrate_helio_constant_accel(
-                start_pos, start_vel, accel_vec1, t1, date)
-            
-            for t in t_brake:
-                if t == 0:
-                    pos, vel = turn_pos.copy(), turn_vel.copy()
-                else:
-                    pos, vel = self._integrate_helio_constant_accel(
-                        turn_pos, turn_vel, accel_vec2, t, date)
-                pos_points.append(pos)
-                vel_points.append(vel)
-                t_points.append(t1 + t)
-            
-            return (np.array(t_points), 
-                    np.array(pos_points).T, 
-                    np.array(vel_points).T, 
-                    turn_pos)
+                               t1, t2, date=None, num_points=1000):
+        """
+        return full trajectory for flip-and-burn brachistochrone.
+        theta : elevation angle from ecliptic plane
+        phi1, phi2 : ecliptic longitude of thrust direction (rad)
+        t1, t2 : burn times, s
+        """
+        u1 = np.array([np.cos(theta) * np.cos(phi1),
+                    np.cos(theta) * np.sin(phi1),
+                    np.sin(theta)])
+        u2 = np.array([np.cos(theta) * np.cos(phi2),
+                    np.cos(theta) * np.sin(phi2),
+                    np.sin(theta)])
+        
+        accel_vec1 = self.accel * u1
+        accel_vec2 = -self.accel * u2
+        
+        t_boost = np.linspace(0, t1, num_points // 2)
+        t_brake = np.linspace(0, t2, num_points - len(t_boost))
+        
+        pos_points = []
+        vel_points = []
+        t_points = []
+        phase = []
+        
+        for t in t_boost:
+            if t == 0:
+                pos, vel = start_pos.copy(), start_vel.copy()
+            else:
+                # Use the integrator to get state at time t
+                pos, vel = self._integrate_helio_constant_accel(
+                    start_pos, start_vel, accel_vec1, t, date)
+            pos_points.append(pos)
+            vel_points.append(vel)
+            t_points.append(t)
+            phase.append(0)
+        
+        mid_pos, mid_vel = self._integrate_helio_constant_accel(
+            start_pos, start_vel, accel_vec1, t1, date)
 
-# -------------------------------------------------------------------
+        for t in t_brake:
+            if t == 0:
+                pos, vel = mid_pos.copy(), mid_vel.copy()
+            else:
+                pos, vel = self._integrate_helio_constant_accel(
+                    mid_pos, mid_vel, accel_vec2, t, date)
+            pos_points.append(pos)
+            vel_points.append(vel)
+            t_points.append(t1 + t)
+            phase.append(1)
+        
+        return (np.array(t_points), 
+                np.array(pos_points).T, 
+                np.array(vel_points).T, 
+                mid_pos)
 
-    def _cost_function(self, pos, vel, target_pos, target_vel=None,
-                      w_pos=1e-4, w_vel=3e6):
+    def cost_function(self, pos, vel, target_pos, target_vel=None,
+                      w_pos=1e-4, w_vel=3e7):
         cost = w_pos * np.linalg.norm(pos - target_pos) ** 3
         cost += w_vel * np.linalg.norm(vel - target_vel) ** 4
-        return cost  
+        return cost    
+
 
     def _determine_soi(self, heliocentric_pos, date):
         """Return the body whose SOI contains the given heliocentric position."""
@@ -243,11 +280,12 @@ class Optimizer:
         return helio_pos - to_pos, helio_vel - to_vel
 
     def _gravity_accel(self, pos_rel, body):
-        # if body == 'neutral':
-        #     return np.zeros(3)
+        """Gravitational acceleration in body-centered frame. Zero inside radius."""
+        if body == 'neutral':
+            return np.zeros(3)
         r = np.linalg.norm(pos_rel)
-        # if r <= CELESTIAL_RADII[body]:
-        #     return np.zeros(3)
+        if r <= CELESTIAL_RADII[body]:
+            return np.zeros(3)
         return -CELESTIAL_GM[body] * pos_rel / r**3
 
     def _integrate_soi_segment(self, pos, vel, accel, duration, body):
@@ -378,13 +416,12 @@ class Optimizer:
     def _integrate_helio_constant_accel(self, start_pos, start_vel, accel_vec,
                                     duration, date):
         """
-        Integrate in heliocentric frame with only Sun gravity + constant acceleration.
-        No SOI checks. Returns final position, velocity (heliocentric).
+        integrate with only sun gravity + constant acceleration
         """
         max_duration = 500 * 86400
         if duration > max_duration:
             duration = max_duration
-        
+
         def rhs(t, state):
             r = state[:3]
             v = state[3:]
@@ -404,42 +441,10 @@ class Optimizer:
         return sol.y[:3, -1], sol.y[3:, -1]
 
 
-    def _maneuver(self, start_pos, start_vel, direction, burn_time,
-                 accel_modulus=None, date=None):
-        """Return final state after burn. Stores full trajectory internally."""
-        t, pos, vel, bodies = self.trajectory(start_pos, start_vel, direction,
-                                              burn_time, accel_modulus, date)
-        last_body = bodies[-1]
-        if last_body != 'sun':
-            end_pos, end_vel = self._convert_frame(pos[:, -1], vel[:, -1],
-                                                   last_body, 'sun', date)
-        else:
-            end_pos, end_vel = pos[:, -1], vel[:, -1]
-        return end_pos, end_vel
-
-    def _maneuver_fast(self, start_pos, start_vel, direction, burn_time,
-                      accel_modulus=None, date=None):
-        """Return final state (heliocentric) without storing trajectory."""
-        if accel_modulus is None:
-            accel_modulus = self.accel
-        direction = np.asarray(direction, dtype=float)
-        norm = np.linalg.norm(direction)
-        if norm == 0:
-            return start_pos.copy(), start_vel.copy()
-        accel_vector = accel_modulus * direction / norm
-
-        start_body = self._determine_soi(start_pos, date)
-        pos_rel, vel_rel = self._convert_frame(start_pos, start_vel,
-                                               'sun', start_body, date)
-        end_pos_helio, end_vel_helio = self._integrate_with_soi_switching(
-            pos_rel, vel_rel, accel_vector, burn_time, date,
-            store_trajectory=False)
-        return end_pos_helio, end_vel_helio
-
 
 if __name__ == "__main__":
     
-    date_str = '2040-01-01 00:00:00'
+    date_str = '2077-01-01 00:00:00'
     
     earth_pos, earth_vel = get_heliocentric_state('earth', date_str)
     mars_pos, mars_vel = get_heliocentric_state('mars', date_str)
