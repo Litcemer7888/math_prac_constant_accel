@@ -6,172 +6,185 @@ from matplotlib.widgets import Button
 from astropy.time import Time
 import astropy.units as u
 
-from constants import get_heliocentric_state, PLANET_DATA, AU, CELESTIAL_RADII
-from optimizer import Optimizer
+from constants import get_heliocentric_state, PLANET_DATA, AU
 
+ECLIPTIC_INCLINATION = np.radians(-23.5)
+ROTATION_MATRIX = np.array([
+    [1, 0, 0],
+    [0, np.cos(ECLIPTIC_INCLINATION), -np.sin(ECLIPTIC_INCLINATION)],
+    [0, np.sin(ECLIPTIC_INCLINATION), np.cos(ECLIPTIC_INCLINATION)]
+])
 
+def apply_rotation(points):
+    points = np.asarray(points)
+    if points.ndim == 1:
+        return ROTATION_MATRIX @ points
+    elif points.shape[0] == 3:
+        return ROTATION_MATRIX @ points
+    elif points.shape[1] == 3:
+        return points @ ROTATION_MATRIX.T
+    else:
+        raise ValueError(f"Неверная форма: {points.shape}")
+
+# ---------- Константы визуализации ----------
 PLANET_COLORS = {
-    'mercury': 'gray',
-    'venus':   'orange',
-    'earth':   'blue',
-    'mars':    'red',
-    'jupiter': 'brown',
-    'saturn':  'gold',
-    'uranus':  'lightblue',
-    'neptune': 'darkblue',
-    'sun':     'yellow'
+    'mercury': 'gray', 'venus': 'orange', 'earth': 'blue', 'mars': 'red',
+    'jupiter': 'brown', 'saturn': 'gold', 'uranus': 'lightblue', 'neptune': 'darkblue', 'sun': 'yellow'
 }
-
 PLANET_SIZES = {
-    'mercury': 30,
-    'venus':   40,
-    'earth':   45,
-    'mars':    35,
-    'jupiter': 90,
-    'saturn':  80,
-    'uranus':  55,
-    'neptune': 50,
-    'sun':     150
+    'mercury': 30, 'venus': 40, 'earth': 45, 'mars': 35,
+    'jupiter': 90, 'saturn': 80, 'uranus': 55, 'neptune': 50, 'sun': 150
 }
 
-
-def get_planet_positions_at_time(date):
-    """Позиции планет в AU на момент date."""
+# ---------- Вспомогательные функции ----------
+def get_planet_positions_at_time(date, planets_list=None, apply_rot=True):
     if isinstance(date, str):
         time = Time(date, scale='tdb')
     else:
         time = date
     positions = {}
-    for name in PLANET_DATA.keys():
+    if planets_list is None:
+        planets_list = PLANET_DATA.keys()
+    for name in planets_list:
         pos, _ = get_heliocentric_state(name, time)
-        positions[name] = pos / AU
+        pos_au = pos / AU
+        if apply_rot:
+            pos_au = apply_rotation(pos_au)
+        positions[name] = pos_au
     return positions
 
+def plot_orbit_circular(ax, a_au, color='gray', linestyle='--', linewidth=0.5, alpha=0.5):
+    theta = np.linspace(0, 2*np.pi, 300)
+    ax.plot(a_au * np.cos(theta), a_au * np.sin(theta), 0,
+            color=color, linestyle=linestyle, linewidth=linewidth, alpha=alpha)
 
-def plot_elliptical_orbit(ax, planet_name, time_start, duration_days=800, num_points=300):
-    """Орбита планеты через astropy."""
-    if planet_name == 'sun':
-        return
-    t0 = Time(time_start, scale='tdb')
-    times = t0 + np.linspace(0, duration_days, num_points) * u.day
-    orbit_points = []
-    for t in times:
-        pos, _ = get_heliocentric_state(planet_name, t)
-        orbit_points.append(pos / AU)
-    orbit_points = np.array(orbit_points).T
-    ax.plot(orbit_points[0, :], orbit_points[1, :], orbit_points[2, :],
-            color=PLANET_COLORS.get(planet_name, 'gray'),
-            linestyle='-', linewidth=1.5, alpha=0.7,
-            label=f'Orbit of {planet_name.capitalize()}')
+def plot_orbits(ax, planets_list):
+    for name in planets_list:
+        if name == 'sun': continue
+        a_au = PLANET_DATA[name]['semi_major_axis'] / AU
+        plot_orbit_circular(ax, a_au, color=PLANET_COLORS.get(name, 'gray'),
+                            linestyle='--', linewidth=0.5, alpha=0.4)
 
+def plot_planets(ax, positions, alpha=1.0, label=None):
+    for name, pos in positions.items():
+        ax.scatter(pos[0], pos[1], pos[2],
+                   color=PLANET_COLORS.get(name, 'white'), s=PLANET_SIZES.get(name, 30),
+                   alpha=alpha, label=label if label else "")
 
-def plot_trajectory(ax, trajectory, color='red', linewidth=2, label='Spacecraft trajectory'):
-    """Траектория корабля (координаты в метрах)."""
-    traj_au = trajectory / AU
+def plot_trajectory(ax, trajectory_m, color='red', linewidth=2, label='Траектория корабля', apply_rot=True):
+    traj_m = np.asarray(trajectory_m)
+    if apply_rot:
+        traj_m = apply_rotation(traj_m)
+    traj_au = traj_m / AU
     ax.plot(traj_au[0, :], traj_au[1, :], traj_au[2, :],
-            color=color, linewidth=linewidth, label=label, alpha=0.9)
+            color=color, linewidth=linewidth, label=label)
     ax.scatter(traj_au[0, 0], traj_au[1, 0], traj_au[2, 0],
-               color='lime', s=120, marker='o', label='Start',
-               edgecolors='darkgreen', linewidth=2, zorder=15)
+               color='lime', s=80, marker='o', label='Старт корабля', edgecolors='darkgreen')
     ax.scatter(traj_au[0, -1], traj_au[1, -1], traj_au[2, -1],
-               color='red', s=120, marker='s', label='Finish',
-               edgecolors='darkred', linewidth=2, zorder=15)
+               color='red', s=80, marker='s', label='Финиш корабля', edgecolors='darkred')
 
+# ---------- Основная функция визуализации ----------
+def visualize_mission(trajectory_m, start_date_str, flight_time_sec,
+                      start_planet='earth', target_planet='mars'):
+    start_time = Time(start_date_str, scale='tdb')
+    end_time = start_time + flight_time_sec * u.s
+    end_date_str = end_time.iso
 
-def visualize_mission_from_surface(start_planet, start_date_str, accel, direction,
-                                   burn_time_sec, target_planet=None):
-    """
-    Старт с поверхности, постоянное ускорение, свободный режим.
-    """
-    radius_m = CELESTIAL_RADII[start_planet]
-    planet_pos, planet_vel = get_heliocentric_state(start_planet, start_date_str)
-
-    dir_norm = np.linalg.norm(direction)
-    if dir_norm == 0:
-        raise ValueError("Direction vector cannot be zero")
-    direction = np.array(direction) / dir_norm
-    start_pos = planet_pos + radius_m * direction
-    start_vel = planet_vel.copy()
-
-    opt = Optimizer(accel=accel, mode='free')
-    t_array, pos_traj, vel_traj = opt.trajectory(start_pos, start_vel,
-                                                 direction, burn_time_sec)
-
-    flight_days = burn_time_sec / 86400
-    end_time = Time(start_date_str, scale='tdb') + burn_time_sec * u.s
     print("=" * 60)
-    print(f"Mission: from {start_planet.capitalize()} surface")
-    print(f"Acceleration: {accel:.2f} m/s², direction: {direction}")
-    print(f"Burn time: {burn_time_sec:.0f} s ({flight_days:.4f} days)")
-    print(f"Start date: {start_date_str}")
-    print(f"End date:   {end_time.iso}")
-
-    start_au = pos_traj[:, 0] / AU
-    end_au = pos_traj[:, -1] / AU
-    dist_au = np.linalg.norm(end_au - start_au)
-    print(f"Distance travelled: {dist_au:.5f} AU ({dist_au * 149.6:.2f} million km)")
+    print(f"Миссия: {start_planet.capitalize()} → {target_planet.capitalize()}")
+    print(f"Старт: {start_date_str}")
+    print(f"Финиш: {end_date_str}")
+    print(f"Длительность: {flight_time_sec / 86400:.2f} дней")
+    print(f"Дальность: {np.linalg.norm(trajectory_m[:,-1] - trajectory_m[:,0]) / AU:.5f} AU")
     print("=" * 60)
 
-    planet_pos_au = planet_pos / AU
+    start_positions = get_planet_positions_at_time(start_date_str, [start_planet], apply_rot=True)
+    end_positions   = get_planet_positions_at_time(end_date_str, [target_planet], apply_rot=True)
 
-    fig = plt.figure(figsize=(14, 10))
+    fig = plt.figure(figsize=(16, 10))
     ax = fig.add_subplot(111, projection='3d')
-    ax.set_title(f"Launch from {start_planet.capitalize()} surface\n"
-                 f"Start: {start_date_str[:10]}   End: {end_time.iso[:10]}",
+    ax.set_title(f"{start_planet.capitalize()} → {target_planet.capitalize()}\n{start_date_str[:10]} → {end_date_str[:10]}",
                  fontsize=14, fontweight='bold')
-    ax.set_xlabel("X (AU)")
-    ax.set_ylabel("Y (AU)")
-    ax.set_zlabel("Z (AU)")
+    ax.set_xlabel("X (AU)"); ax.set_ylabel("Y (AU)"); ax.set_zlabel("Z (AU)")
 
-    ax.scatter(0, 0, 0, color='yellow', s=PLANET_SIZES['sun'],
-               label='Sun', edgecolors='orange', linewidth=1, zorder=10)
+    # Солнце
+    ax.scatter(0, 0, 0, color='yellow', s=PLANET_SIZES['sun'], label='Солнце', edgecolors='orange')
+    # Орбиты
+    plot_orbits(ax, [start_planet, target_planet])
+    # Планеты
+    plot_planets(ax, start_positions, alpha=1.0, label=f"{start_planet.capitalize()} (старт)")
+    plot_planets(ax, end_positions, alpha=0.4, label=f"{target_planet.capitalize()} (финиш)")
+    # Траектория
+    plot_trajectory(ax, trajectory_m, apply_rot=True)
 
-    plot_elliptical_orbit(ax, start_planet, start_date_str)
+    # Легенда
+    handles, labels = ax.get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    ax.legend(unique.values(), unique.keys(), loc='center left', bbox_to_anchor=(1.05, 0.5),
+              fontsize='small', framealpha=0.9)
 
-    ax.scatter(planet_pos_au[0], planet_pos_au[1], planet_pos_au[2],
-               color=PLANET_COLORS.get(start_planet, 'white'),
-               s=PLANET_SIZES.get(start_planet, 40),
-               label=f"{start_planet.capitalize()} at start",
-               edgecolors='black', linewidth=0.5, zorder=5)
-
-    plot_trajectory(ax, pos_traj)
-
-    ax.legend(loc='upper left', fontsize='small', framealpha=0.9)
-
-    padding = 1.0
-    ax.set_xlim(planet_pos_au[0] - padding, planet_pos_au[0] + padding)
-    ax.set_ylim(planet_pos_au[1] - padding, planet_pos_au[1] + padding)
-    ax.set_zlim(planet_pos_au[2] - padding, planet_pos_au[2] + padding)
-
-    def zoom_to_planet(event):
-        ax.set_xlim(planet_pos_au[0] - 0.5, planet_pos_au[0] + 0.5)
-        ax.set_ylim(planet_pos_au[1] - 0.5, planet_pos_au[1] + 0.5)
-        ax.set_zlim(planet_pos_au[2] - 0.5, planet_pos_au[2] + 0.5)
-        fig.canvas.draw_idle()
+    ax.set_xlim(-5, 5); ax.set_ylim(-5, 5); ax.set_zlim(-5, 5)
+    plt.subplots_adjust(bottom=0.1, right=0.85)
 
     def zoom_to_sun(event):
-        ax.set_xlim(-3, 3)
-        ax.set_ylim(-3, 3)
-        ax.set_zlim(-3, 3)
+        ax.set_xlim(-5, 5)
+        ax.set_ylim(-5, 5)
+        ax.set_zlim(-5, 5)
         fig.canvas.draw_idle()
 
-    plt.subplots_adjust(bottom=0.1)
-    ax_button_planet = plt.axes([0.6, 0.02, 0.18, 0.06])
-    btn_planet = Button(ax_button_planet, f'Zoom to {start_planet.capitalize()}')
-    btn_planet.on_clicked(zoom_to_planet)
+    def zoom_to_target(event):
+        pos = end_positions[target_planet]
+        ax.set_xlim(pos[0] - 0.8, pos[0] + 0.8)
+        ax.set_ylim(pos[1] - 0.8, pos[1] + 0.8)
+        ax.set_zlim(pos[2] - 0.8, pos[2] + 0.8)
+        fig.canvas.draw_idle()
 
-    ax_button_sun = plt.axes([0.8, 0.02, 0.15, 0.06])
-    btn_sun = Button(ax_button_sun, 'Zoom to Sun')
+    ax_btn_sun = plt.axes([0.75, 0.02, 0.12, 0.06])
+    btn_sun = Button(ax_btn_sun, 'Сброс к Солнцу')
     btn_sun.on_clicked(zoom_to_sun)
 
+    ax_btn_target = plt.axes([0.60, 0.02, 0.14, 0.06])
+    btn_target = Button(ax_btn_target, f'Приблизить к {target_planet.capitalize()}')
+    btn_target.on_clicked(zoom_to_target)
+
     plt.show()
-    return pos_traj, t_array
 
 
+# ---------- Пример использования с оптимизатором брахистохроны ----------
 if __name__ == "__main__":
+    from optimizer import Optimizer
+    from constants import get_heliocentric_state
+    from datetime import datetime, timedelta
+
     start_planet = 'earth'
-    start_date = '2030-01-01 00:00:00'
-    accel = 10.0
-    direction = np.array([1.0, 0.0, 0.0])
-    burn_time = 3600.0
-    visualize_mission_from_surface(start_planet, start_date, accel, direction, burn_time)
+    target_planet = 'mars'
+    start_date_str = '2030-01-01 00:00:00'
+    accel = 0.5  # м/с²
+
+    start_pos, start_vel = get_heliocentric_state(start_planet, start_date_str)
+    opt = Optimizer(accel=accel)
+
+    print("Оптимизация брахистохроны...")
+    try:
+        res = opt.find_brachistochrone(start_pos, start_vel, target_planet,
+                                       date=start_date_str, w_pos=1e-4, w_vel=1e4)
+        theta, phi1, phi2, t1, t2 = res.x
+    except Exception as e:
+        print(f"Ошибка: {e}\nИспользуем тестовые параметры.")
+        theta, phi1, phi2 = np.radians(0.0), np.radians(0.0), np.radians(180.0)
+        t1 = t2 = 100 * 86400  # 100 дней
+
+    total_time = t1 + t2
+    # Получаем траекторию (метры)
+    _, pos_points, _, _ = opt.brachistochrone_trajectory(
+        start_pos, start_vel, theta, phi1, phi2, t1, t2, start_date_str, num_points=500)
+
+    # Вычисляем дату прибытия (только для справки)
+    start_dt = datetime.strptime(start_date_str, '%Y-%m-%d %H:%M:%S')
+    arrival_dt = start_dt + timedelta(seconds=total_time)
+    print(f"Параметры: theta={np.degrees(theta):.1f}°, phi1={np.degrees(phi1):.1f}°, "
+          f"phi2={np.degrees(phi2):.1f}°, t1={t1/86400:.2f} дн, t2={t2/86400:.2f} дн")
+    print(f"Полёт: {total_time/86400:.2f} дней, финиш {arrival_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    visualize_mission(pos_points, start_date_str, total_time,
+                      start_planet=start_planet, target_planet=target_planet)
