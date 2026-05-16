@@ -181,7 +181,7 @@ class Optimizer:
             arrival_date_str = arrival_date.strftime('%Y-%m-%d %H:%M:%S')
             target_pos, target_vel = get_heliocentric_state(target_body, arrival_date_str)
 
-            return self.cost_function(sc_pos, sc_vel, target_pos, target_vel)
+            return self._cost_function(sc_pos, sc_vel, target_pos, target_vel)
 
         default_opts = {'maxiter': 500, 
                         'xtol': 1e-12,
@@ -252,7 +252,7 @@ class Optimizer:
                 np.array(vel_points).T, 
                 mid_pos)
 
-    def cost_function(self, pos, vel, target_pos, target_vel=None,
+    def _cost_function(self, pos, vel, target_pos, target_vel=None,
                       w_pos=1e-4, w_vel=3e7):
         cost = w_pos * np.linalg.norm(pos - target_pos) ** 3
         cost += w_vel * np.linalg.norm(vel - target_vel) ** 4
