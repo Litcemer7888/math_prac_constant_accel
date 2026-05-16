@@ -1,6 +1,8 @@
 # math_prac_constant_accel
 a repository with mipt math practicum project
 
+Проект запускается через файл visualization.py
+
 План
 0) найти всякие константы, начальные параметры 
 1) написать планеты, чтоб условно можно было получить координаты от даты
